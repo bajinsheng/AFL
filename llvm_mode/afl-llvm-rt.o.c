@@ -49,7 +49,7 @@
 #ifdef USE_TRACE_PC
 #  define CONST_PRIO 5
 #else
-#  define CONST_PRIO 0
+#  define CONST_PRIO 5
 #endif /* ^USE_TRACE_PC */
 
 
@@ -144,7 +144,7 @@ static void __afl_start_forkserver(void) {
         close(FORKSRV_FD);
         close(FORKSRV_FD + 1);
         return;
-  
+
       }
 
     } else {

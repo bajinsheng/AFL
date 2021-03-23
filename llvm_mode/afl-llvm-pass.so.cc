@@ -181,7 +181,7 @@ static void buildInit(Module *M, std::vector<Constant *> &Metadata)
         builder.CreateCall(Init, {Array});
         builder.CreateRetVoid();
 
-        appendToGlobalCtors(*M, F, 111);
+        appendToGlobalCtors(*M, F, 1);
 
         std::string Asm; // Polulate all elements in the array with fs:0x28
         Asm +=
@@ -246,7 +246,7 @@ static void replaceAlloca(Module *M, Instruction *I,
         builder.getVoidTy(), builder.getInt8PtrTy(),
         builder.getInt64Ty());
 
-    builder.CreateCall(Init, {NewAlloca, NewSize}); // call the check fun with allocation pointer and size
+    builder.CreateCall(Init, {NewAlloca, NewSize}); // call the canary initialization fun with allocation pointer and size
     Value *Ptr = builder.CreateBitCast(NewAlloca, Alloca->getType()); // convert the pointer to the original pointer
 
     std::vector<User *> Replace, Lifetimes; // Update the user info
