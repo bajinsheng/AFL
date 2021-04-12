@@ -90,22 +90,53 @@ static void buildCheck(Module *M)
     Value *IPtr = builder.CreatePtrToInt(Ptr, builder.getInt64Ty());
     IPtr = builder.CreateAdd(IPtr, builder.getInt64(-1));
     IPtr = builder.CreateAdd(IPtr, Size);
-    IPtr = builder.CreateAnd(IPtr, builder.getInt64(-sizeof(uint64_t)));
     Ptr = builder.CreateIntToPtr(IPtr, builder.getInt64Ty()->getPointerTo());
-    Value *Val64 = builder.CreateAlignedLoad(Ptr, MaybeAlign(sizeof(uint64_t)));
 
+    /*
+     * rax: the origin pointer of the last byte [retain the delta]
+     * rbx: the first token [check the canary]
+     * rcx: the fs:40 value [the canary baseline]
+     * rdx: the second token [check the page size offset]
+     * r10: the second token [check the canary]
+     * r11: the second token [check the delta]
+     */
     const char *asmStr =
-        "addq %fs:40, $0\n"
+        "mov $0, %rbx\n"
+        "andq $$-0x8, %rbx\n"
+        "mov %rbx, %rdx\n"
+        "mov (%rbx), %rbx\n"
+        "mov %fs:40, %rcx\n"
+        "andq $$-0x8, %rcx\n"
+        "addq %rcx, %rbx\n"
         "jne .Lok_${:uid}\n"
         "ud2\n"
-        ".Lok_${:uid}:";
+        ".Lok_${:uid}:\n"
+        "addq $$0x8, %rdx\n"
+        "mov %rdx, %r10\n"
+        "and $$0xfff, %edx\n"
+        "test %edx, %edx\n"
+        "je .Lok2_${:uid}\n"
+        "mov (%r10), %r10\n"
+        "mov %r10, %r11\n"
+        "andq $$-0x8, %r10\n"
+        "addq %rcx, %r10\n"
+        "jne .Lok2_${:uid}\n"
+        "andq $$0x7, %r11\n"
+        "andq $$0x7, %rax\n"
+        "test %r11, %r11\n"
+        "je .Lok2_${:uid}\n"
+        "cmp %rax, %r11\n"
+        "ja .Lok2_${:uid}\n"
+        "ud2\n"
+        ".Lok2_${:uid}:\n"
+        ;
     llvm::FunctionType *AsmTy = llvm::FunctionType::get(
         builder.getInt64Ty(), {builder.getInt64Ty()}, false);
     const char *asmFlags = "=r,0,~{dirflag},~{fpsr},~{flags}";
     auto *AsmFunc = llvm::InlineAsm::get(AsmTy, asmStr, asmFlags,
         /*hasSideEffects=*/true);
 
-    builder.CreateCall(AsmFunc, {Val64});
+    builder.CreateCall(AsmFunc, {Ptr});
     builder.CreateRetVoid();
 
     F->setDoesNotThrow();
@@ -124,12 +155,13 @@ static void buildInit(Module *M, std::vector<Constant *> &Metadata)
         if (F != nullptr)
             F->setDoesNotThrow();
 
-        std::string Asm; // Insert the canary value fs:0x28 to the tail of the allocated memory location
+        std::string Asm; // Insert the neg of the canary value fs:0x28 to the tail (the last 8-bytes aligned region) of the allocated memory location
         Asm +=
             ".type __init_stk_obj, @function\n"
             ".weak __init_stk_obj\n"
             "__init_stk_obj:\n"
             "\tlea (%rdi,%rsi),%rsi\n"
+            "\tlea (%rdi,%rdx),%rdx\n"
             "\tandq $-8,%rsi\n"
             "\taddq $-8,%rsi\n"
             "\txor %eax,%eax\n"
@@ -143,6 +175,9 @@ static void buildInit(Module *M, std::vector<Constant *> &Metadata)
             "\tmov %fs:40, %rax\n"
             "\tmov %rax,(%rsi)\n"
             "\tnegq (%rsi)\n"
+            "\tandq $-8,(%rsi)\n"
+            "\tandq $0x7,%rdx\n"
+            "\txor %rdx,(%rsi)\n"
             "\tretq\n";
         M->appendModuleInlineAsm(Asm);
     }
@@ -153,16 +188,9 @@ static void buildInit(Module *M, std::vector<Constant *> &Metadata)
             return;
 
         LLVMContext &Cxt = M->getContext();
-        /*
-        Value *Ctor = M->getOrInsertFunction("__init_gbl_objs_ctor",
-            Type::getVoidTy(Cxt), nullptr);
-        Function *F = dyn_cast<Function>(Ctor);
-        assert(F != nullptr);
-        F->setLinkage(GlobalValue::InternalLinkage);
-        */
         llvm::FunctionType *glbFunTy = llvm::FunctionType::get(
         Type::getVoidTy(Cxt), {}, false);
-        Function *F = Function::Create(glbFunTy, GlobalValue::InternalLinkage, "__init_gbl_objs_ctor", M); // create global variable initialization function
+        Function *F = Function::Create(glbFunTy, GlobalValue::InternalLinkage, "__init_gbl_objs_ctor", M);
         BasicBlock *Entry = BasicBlock::Create(M->getContext(), "", F);
         IRBuilder<> builder(Entry);
 
@@ -192,8 +220,13 @@ static void buildInit(Module *M, std::vector<Constant *> &Metadata)
             "\taddq $8,%rdi\n"
             "\ttestq %rsi,%rsi\n"
             "\tje .Lreturn\n"
+            "\tmov %rsi, %r13\n"
+            "\tandq $7, %r13\n"
             "\tandq $-8,%rsi\n"
+            "\ttest %r13, %r13\n"
+            "\tjz .Laligned\n"
             "\taddq $8,%rsi\n"
+            ".Laligned:\n"
 
             // It seems that some globals can escape the __canary_gbls
             // section, so we add an additional sanity check...
@@ -205,9 +238,12 @@ static void buildInit(Module *M, std::vector<Constant *> &Metadata)
             "\tcmpq %rax,%rsi\n"
             "\tjge __init_gbl_objs\n"
 
+
             "\tmov %fs:40,%rax\n"
+            "\tnegq %rax\n"
+            "\tandq $-8,%rax\n"
+            "\txorq %r13, %rax\n"
             "\tmov %rax,(%rsi)\n"
-            "\tnegq (%rsi)\n"
             "\tjmp __init_gbl_objs\n"
             ".Lreturn:\n"
             "\tretq\n";
@@ -244,9 +280,9 @@ static void replaceAlloca(Module *M, Instruction *I,
 
     FunctionCallee Init = M->getOrInsertFunction("__init_stk_obj",
         builder.getVoidTy(), builder.getInt8PtrTy(),
-        builder.getInt64Ty());
+        builder.getInt64Ty(), builder.getInt64Ty());
 
-    builder.CreateCall(Init, {NewAlloca, NewSize}); // call the canary initialization fun with allocation pointer and size
+    builder.CreateCall(Init, {NewAlloca, NewSize, OldSize}); // call the canary initialization fun with allocation pointer and size
     Value *Ptr = builder.CreateBitCast(NewAlloca, Alloca->getType()); // convert the pointer to the original pointer
 
     std::vector<User *> Replace, Lifetimes; // Update the user info
@@ -282,7 +318,6 @@ static void replaceAlloca(Module *M, Instruction *I,
         if (auto *Lifetime = dyn_cast<Instruction>(Usr))
             dels.push_back(Lifetime);
     }
-//        Usr->replaceUsesOfWith(Alloca, NewAlloca);
 
     Alloca->replaceAllUsesWith(Ptr);
     dels.push_back(Alloca);
@@ -318,30 +353,28 @@ static void replaceGlobal(Module *M, GlobalVariable *GV,
         return;
 
     const DataLayout &DL = M->getDataLayout();
-    size_t size = DL.getTypeAllocSize(Ty); // get original size
-    size_t new_size = size + 2 * sizeof(uint64_t); // set the new size = old size + 16
-    size_t canary_size = new_size - size; // the size storing the canary
+    size_t size = DL.getTypeAllocSize(Ty);                                  // acquire the size of the original data
+    size_t new_size = size + 2 * sizeof(uint64_t);
+    size_t canary_size = new_size - size;                                   // set the size of the token
 
     LLVMContext &Cxt = M->getContext();
-    Type *CanaryTy = ArrayType::get(Type::getInt8Ty(Cxt), canary_size); // set the type of the memory storing canary
-    StructType *WrapTy = StructType::get(Cxt, {Ty, CanaryTy}, false); // set overall type combining old data and canary
+    Type *CanaryTy = ArrayType::get(Type::getInt8Ty(Cxt), canary_size);     // create the data structure of the token
+    StructType *WrapTy = StructType::get(Cxt, {Ty, CanaryTy}, false);
 
     Constant *WrapInit = ConstantStruct::get(WrapTy, {GV->getInitializer(),
         Constant::getNullValue(CanaryTy)});
 
-    GlobalVariable *NewGV = new GlobalVariable(*M, WrapTy, GV->isConstant(), // set the new global variable
+    GlobalVariable *NewGV = new GlobalVariable(*M, WrapTy, GV->isConstant(),// create a data structure which wraps both origin data and the token
         GV->getLinkage(), WrapInit, "", GV, GV->getThreadLocalMode());
-    NewGV->copyAttributesFrom(GV);
-//    if (NewGV->isConstant() && NewGV->getLinkage() == GlobalValue::PrivateLinkage)
-//        NewGV->setLinkage(GlobalValue::InternalLinkage);
+    NewGV->copyAttributesFrom(GV);                                          // copy all previous attributes to the new one
     NewGV->setConstant(false);
-    NewGV->setSection("__canary_gbls"); // set the section storing the new global variable
+    NewGV->setSection("__canary_gbls");                                     // put all new global variables in the new section
 
     Type *Int32Ty = Type::getInt32Ty(Cxt);
     Constant *Idxs00[2] = {ConstantInt::get(Int32Ty, 0),
                            ConstantInt::get(Int32Ty, 0)};
-    GV->replaceAllUsesWith( // change all user pointer
-        ConstantExpr::getGetElementPtr(WrapTy, NewGV, Idxs00, true));
+    GV->replaceAllUsesWith(
+        ConstantExpr::getGetElementPtr(WrapTy, NewGV, Idxs00, true));       // Update all pointers which use the global variable
     NewGV->takeName(GV);
     dels.push_back(GV);
 
@@ -349,12 +382,13 @@ static void replaceGlobal(Module *M, GlobalVariable *GV,
                            ConstantInt::get(Int32Ty, 1)};
     Constant *CanaryPtr = ConstantExpr::getGetElementPtr(WrapTy, NewGV,
         Idxs01, true);
-    CanaryPtr = ConstantExpr::getBitCast(CanaryPtr, Type::getInt8PtrTy(Cxt));
-    Metadata.push_back(CanaryPtr); // metadata stores the all canary global variables.
+    CanaryPtr = ConstantExpr::getBitCast(CanaryPtr, Type::getInt8PtrTy(Cxt));// Get the pointer to the token
+    Metadata.push_back(CanaryPtr);
 }
 
 /*
  * Determine if a memory access should be checked.
+ * If the laod or store instruction operate less than unit memory, we do not need to check it
  */
 static bool shouldCheck(Module *M, Value *Ptr)
 {
@@ -400,9 +434,9 @@ static bool insertCheck(Module *M, Instruction *I)
         Ty = PtrTy->getElementType();
         size = DL->getTypeAllocSize(Ty);
     }
-    Value *Size = builder.getInt64(size);
+    Value *Size = builder.getInt64(size); // calculating the affected memory size
 
-    Ptr = builder.CreateBitCast(Ptr, builder.getInt8PtrTy());
+    Ptr = builder.CreateBitCast(Ptr, builder.getInt8PtrTy()); // cast the real operating pointer address
 
     FunctionCallee Check = M->getOrInsertFunction("__canary_check",
         builder.getVoidTy(), builder.getInt8PtrTy(),
