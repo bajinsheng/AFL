@@ -78,70 +78,55 @@ namespace {
 static void buildCheck(Module *M)
 {
     Function *F = M->getFunction("__canary_check");
-    if (F == nullptr)
-        return;
-    BasicBlock *Entry = BasicBlock::Create(M->getContext(), "", F);
-    IRBuilder<> builder(Entry);
+    if (F != nullptr)
+        F->setDoesNotThrow();
 
-    auto i = F->arg_begin();
-    Value *Ptr  = &(*(i++));
-    Value *Size = &(*(i++));
-
-    Value *IPtr = builder.CreatePtrToInt(Ptr, builder.getInt64Ty());
-    IPtr = builder.CreateAdd(IPtr, builder.getInt64(-1));
-    IPtr = builder.CreateAdd(IPtr, Size);
-    Ptr = builder.CreateIntToPtr(IPtr, builder.getInt64Ty()->getPointerTo());
-
+    std::string asmStr;
     /*
-     * rax: the origin pointer of the last byte [retain the delta]
-     * rbx: the first token [check the canary]
+     * rdi: the origin pointer of the last byte [retain the delta]
+     * rax: the first token [check the canary]
      * rcx: the fs:40 value [the canary baseline]
      * rdx: the second token [check the page size offset]
-     * r10: the second token [check the canary]
-     * r11: the second token [check the delta]
+     * r8: the second token [check the canary]
+     * r9: the second token [check the delta]
      */
-    const char *asmStr =
-        "mov $0, %rbx\n"
-        "andq $$-0x8, %rbx\n"
-        "mov %rbx, %rdx\n"
-        "mov (%rbx), %rbx\n"
+    asmStr +=
+        ".type __canary_check, @function\n"
+        ".weak __canary_check\n"
+        "__canary_check:\n"
+        "addq $-0x1, %rdi\n"
+        "addq %rsi, %rdi\n"
+        "mov %rdi, %rax\n"
+        "andq $-0x8, %rax\n"
+        "mov %rax, %rdx\n"
+        "mov (%rax), %rax\n"
+        "andq $-0x8, %rax\n"
         "mov %fs:40, %rcx\n"
-        "andq $$-0x8, %rcx\n"
-        "addq %rcx, %rbx\n"
-        "jne .Lok_${:uid}\n"
+        "andq $-0x8, %rcx\n"
+        "addq %rcx, %rax\n"
+        "jne .Lok_a\n"
         "ud2\n"
-        ".Lok_${:uid}:\n"
-        "addq $$0x8, %rdx\n"
-        "mov %rdx, %r10\n"
-        "and $$0xfff, %edx\n"
+        ".Lok_a:\n"
+        "addq $0x8, %rdx\n"
+        "mov %rdx, %r8\n"
+        "and $0xfff, %edx\n"
         "test %edx, %edx\n"
-        "je .Lok2_${:uid}\n"
-        "mov (%r10), %r10\n"
-        "mov %r10, %r11\n"
-        "andq $$-0x8, %r10\n"
-        "addq %rcx, %r10\n"
-        "jne .Lok2_${:uid}\n"
-        "andq $$0x7, %r11\n"
-        "andq $$0x7, %rax\n"
-        "test %r11, %r11\n"
-        "je .Lok2_${:uid}\n"
-        "cmp %rax, %r11\n"
-        "ja .Lok2_${:uid}\n"
+        "je .Lok2_a\n"
+        "mov (%r8), %r8\n"
+        "mov %r8, %r9\n"
+        "andq $-0x8, %r8\n"
+        "addq %rcx, %r8\n"
+        "jne .Lok2_a\n"
+        "andq $0x7, %r9\n"
+        "andq $0x7, %rdi\n"
+        "test %r9, %r9\n"
+        "je .Lok2_a\n"
+        "cmp %rdi, %r9\n"
+        "ja .Lok2_a\n"
         "ud2\n"
-        ".Lok2_${:uid}:\n"
-        ;
-    llvm::FunctionType *AsmTy = llvm::FunctionType::get(
-        builder.getInt64Ty(), {builder.getInt64Ty()}, false);
-    const char *asmFlags = "=r,0,~{dirflag},~{fpsr},~{flags}";
-    auto *AsmFunc = llvm::InlineAsm::get(AsmTy, asmStr, asmFlags,
-        /*hasSideEffects=*/true);
-
-    builder.CreateCall(AsmFunc, {Ptr});
-    builder.CreateRetVoid();
-
-    F->setDoesNotThrow();
-    F->setLinkage(GlobalValue::InternalLinkage);
-    F->addFnAttr(llvm::Attribute::AlwaysInline);
+        ".Lok2_a:\n"
+        "retq\n";
+    M->appendModuleInlineAsm(asmStr);
 }
 
 /*
@@ -220,10 +205,10 @@ static void buildInit(Module *M, std::vector<Constant *> &Metadata)
             "\taddq $8,%rdi\n"
             "\ttestq %rsi,%rsi\n"
             "\tje .Lreturn\n"
-            "\tmov %rsi, %r13\n"
-            "\tandq $7, %r13\n"
+            "\tmov %rsi, %rdx\n"
+            "\tandq $7, %rdx\n"
             "\tandq $-8,%rsi\n"
-            "\ttest %r13, %r13\n"
+            "\ttest %rdx, %rdx\n"
             "\tjz .Laligned\n"
             "\taddq $8,%rsi\n"
             ".Laligned:\n"
@@ -242,7 +227,7 @@ static void buildInit(Module *M, std::vector<Constant *> &Metadata)
             "\tmov %fs:40,%rax\n"
             "\tnegq %rax\n"
             "\tandq $-8,%rax\n"
-            "\txorq %r13, %rax\n"
+            "\txorq %rdx, %rax\n"
             "\tmov %rax,(%rsi)\n"
             "\tjmp __init_gbl_objs\n"
             ".Lreturn:\n"
