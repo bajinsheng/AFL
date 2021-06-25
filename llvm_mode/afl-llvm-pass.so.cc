@@ -60,6 +60,7 @@ namespace {
     public:
 
       static char ID;
+      static size_t nonce_size;
       AFLCoverage() : ModulePass(ID) { }
 
       bool runOnModule(Module &M) override;
@@ -72,61 +73,71 @@ namespace {
 
 }
 
+char AFLCoverage::ID = 0;
+size_t AFLCoverage::nonce_size = 61;
+
 /*
- * Build the canary check function.
+ * Build the check function.
  */
 static void buildCheck(Module *M)
 {
-    Function *F = M->getFunction("__canary_check");
+    Function *F = M->getFunction("__prasan_check");
     if (F != nullptr)
         F->setDoesNotThrow();
 
-    std::string asmStr;
+    std::string Asm;
     /*
      * rdi: the origin pointer of the last byte [retain the delta]
-     * rax: the first token [check the canary]
-     * rcx: the fs:40 value [the canary baseline]
+     * rax: the first token [check the token]
+     * rcx: the fs:40 value [the token baseline]
      * rdx: the second token [check the page size offset]
-     * r8: the second token [check the canary]
+     * r8: the second token [check the token]
      * r9: the second token [check the delta]
      */
-    asmStr +=
-        ".type __canary_check, @function\n"
-        ".weak __canary_check\n"
-        "__canary_check:\n"
+    Asm +=
+        ".type __prasan_check, @function\n"
+        ".weak __prasan_check\n"
+        "__prasan_check:\n"
         "addq $-0x1, %rdi\n"
         "addq %rsi, %rdi\n"
         "mov %rdi, %rax\n"
         "andq $-0x8, %rax\n"
         "mov %rax, %rdx\n"
-        "mov (%rax), %rax\n"
-        "andq $-0x8, %rax\n"
-        "mov %fs:40, %rcx\n"
-        "andq $-0x8, %rcx\n"
+        "mov (%rax), %rax\n";
+    if (AFLCoverage::nonce_size == 61) {
+        Asm +=
+            "andq $-0x8, %rax\n";
+    }
+    Asm +=
+        "mov 0x10000, %rcx\n"
         "addq %rcx, %rax\n"
         "jne .Lok_a\n"
         "ud2\n"
-        ".Lok_a:\n"
-        "addq $0x8, %rdx\n"
-        "mov %rdx, %r8\n"
-        "and $0xfff, %edx\n"
-        "test %edx, %edx\n"
-        "je .Lok2_a\n"
-        "mov (%r8), %r8\n"
-        "mov %r8, %r9\n"
-        "andq $-0x8, %r8\n"
-        "addq %rcx, %r8\n"
-        "jne .Lok2_a\n"
-        "andq $0x7, %r9\n"
-        "andq $0x7, %rdi\n"
-        "test %r9, %r9\n"
-        "je .Lok2_a\n"
-        "cmp %rdi, %r9\n"
-        "ja .Lok2_a\n"
-        "ud2\n"
-        ".Lok2_a:\n"
+        ".Lok_a:\n";
+    if (AFLCoverage::nonce_size == 61) {
+        Asm +=
+            "addq $0x8, %rdx\n"
+            "mov %rdx, %r8\n"
+            "and $0xfff, %edx\n"
+            "test %edx, %edx\n"
+            "je .Lok2_a\n"
+            "mov (%r8), %r8\n"
+            "mov %r8, %r9\n"
+            "andq $-0x8, %r8\n"
+            "addq %rcx, %r8\n"
+            "jne .Lok2_a\n"
+            "andq $0x7, %r9\n"
+            "andq $0x7, %rdi\n"
+            "test %r9, %r9\n"
+            "je .Lok2_a\n"
+            "cmp %rdi, %r9\n"
+            "ja .Lok2_a\n"
+            "ud2\n"
+            ".Lok2_a:\n";
+    }
+    Asm +=
         "retq\n";
-    M->appendModuleInlineAsm(asmStr);
+    M->appendModuleInlineAsm(Asm);
 }
 
 /*
@@ -140,30 +151,43 @@ static void buildInit(Module *M, std::vector<Constant *> &Metadata)
         if (F != nullptr)
             F->setDoesNotThrow();
 
-        std::string Asm; // Insert the neg of the canary value fs:0x28 to the tail (the last 8-bytes aligned region) of the allocated memory location
+        std::string Asm;                // Wrap the stack variables with underflow and overflow token
         Asm +=
             ".type __init_stk_obj, @function\n"
             ".weak __init_stk_obj\n"
             "__init_stk_obj:\n"
-            "\tlea (%rdi,%rsi),%rsi\n"
-            "\tlea (%rdi,%rdx),%rdx\n"
+            "\tmov 0x10000, %rax\n"
+            "\tnegq %rax\n"
+            "\tmov %rax,(%rdi)\n"
+            "\tadd $8,%rdi\n"
+            "\tmov %rax,(%rdi)\n"
+            "\tadd $8,%rdi\n";
+        if (AFLCoverage::nonce_size == 61) {
+            Asm +=
+                "\tandq $-8,%rax\n";
+        }
+        Asm +=
+            "\tlea (%rdi,%rsi),%rsi\n"  // rdi: the start of the allocated memory, rsi: the start of the overflow detection
+            "\tmov %rsi,%rdx\n"
+            "\tadd $7, %rsi\n"
             "\tandq $-8,%rsi\n"
-            "\taddq $-8,%rsi\n"
-            "\txor %eax,%eax\n"
             ".Lloop:\n"
             "\tcmpq %rsi,%rdi\n"
             "\tjge .Lexit\n"
-            "\tmov %rax,(%rdi)\n"
+            "\tmovabsq $0xbebebebebebebebe, %rcx\n"
+            "\tmovq %rcx, (%rdi)\n"
             "\tadd $8,%rdi\n"
             "\tjmp .Lloop\n"
-            ".Lexit:\n"
-            "\tmov %fs:40, %rax\n"
+            ".Lexit:\n";
+        if (AFLCoverage::nonce_size == 61) {
+            Asm +=
+                "\tandq $0x7,%rdx\n"
+                "\txor %rdx,%rax\n";
+        }
+        Asm +=
             "\tmov %rax,(%rsi)\n"
-            "\tnegq (%rsi)\n"
-            "\tandq $-8,(%rsi)\n"
-            "\tandq $0x7,%rdx\n"
-            "\txor %rdx,(%rsi)\n"
             "\tretq\n";
+
         M->appendModuleInlineAsm(Asm);
     }
 
@@ -204,30 +228,35 @@ static void buildInit(Module *M, std::vector<Constant *> &Metadata)
             "\tmovq (%rdi),%rsi\n"
             "\taddq $8,%rdi\n"
             "\ttestq %rsi,%rsi\n"
-            "\tje .Lreturn\n"
-            "\tmov %rsi, %rdx\n"
-            "\tandq $7, %rdx\n"
+            "\tje .Lreturn\n";
+        if (AFLCoverage::nonce_size == 61) {
+            Asm +=
+                "\tmov %rsi, %rdx\n"
+                "\tandq $7, %rdx\n";
+        }
+        Asm +=
+            "\tadd $7,%rsi\n"
             "\tandq $-8,%rsi\n"
-            "\ttest %rdx, %rdx\n"
-            "\tjz .Laligned\n"
-            "\taddq $8,%rsi\n"
-            ".Laligned:\n"
 
-            // It seems that some globals can escape the __canary_gbls
-            // section, so we add an additional sanity check...
+            // It seems that some globals can escape the __prasan_gbls
+            // section, so we add an additional sanity check
+            // If the pointer does not points to the __prasan_gbls section, we ignore this part
 
-            "\tlea __start___canary_gbls(%rip), %rax\n"
+            "\tlea __start___prasan_gbls(%rip), %rax\n"
             "\tcmpq %rax,%rsi\n"
             "\tjl __init_gbl_objs\n"
-            "\tlea __stop___canary_gbls(%rip),%rax\n"
+            "\tlea __stop___prasan_gbls(%rip),%rax\n"
             "\tcmpq %rax,%rsi\n"
             "\tjge __init_gbl_objs\n"
 
 
-            "\tmov %fs:40,%rax\n"
-            "\tnegq %rax\n"
-            "\tandq $-8,%rax\n"
-            "\txorq %rdx, %rax\n"
+            "\tmov 0x10000,%rax\n"
+            "\tnegq %rax\n";
+        if (AFLCoverage::nonce_size == 61) {
+            Asm +=
+                "\txorq %rdx, %rax\n";
+        }
+        Asm +=
             "\tmov %rax,(%rsi)\n"
             "\tjmp __init_gbl_objs\n"
             ".Lreturn:\n"
@@ -238,7 +267,7 @@ static void buildInit(Module *M, std::vector<Constant *> &Metadata)
 }
 
 /*
- * Replace allocas (stack allocation) with an canary-version.
+ * Replace allocas (stack allocation).
  */
 static void replaceAlloca(Module *M, Instruction *I,
     std::vector<Instruction *> &dels)
@@ -256,20 +285,18 @@ static void replaceAlloca(Module *M, Instruction *I,
     const DataLayout &DL = M->getDataLayout(); // get the original data layout
     Value *OldSize = builder.CreateMul(Size,  // old size = the number of new element * the size of each element
         builder.getInt64(DL.getTypeAllocSize(Ty)));
-    Value *NewSize = builder.CreateAdd(OldSize, // new size = old size + 15
-        builder.getInt64(2 * sizeof(uint64_t) - 1));
+    Value *NewSize = builder.CreateAdd(OldSize, // new size = old size + 16 (underflow) + 15 (overflow)
+        builder.getInt64(4 * sizeof(uint64_t) - 1));
 
     AllocaInst *NewAlloca = builder.CreateAlloca(builder.getInt8Ty(), // rewrite the new allocation instruction
         NewSize);
-    NewAlloca->setAlignment(Align(Alloca->getAlignment()));
+    NewAlloca->setAlignment(Align(sizeof(uint64_t)));
 
     FunctionCallee Init = M->getOrInsertFunction("__init_stk_obj",
-        builder.getVoidTy(), builder.getInt8PtrTy(),
-        builder.getInt64Ty(), builder.getInt64Ty());
+        builder.getVoidTy(), builder.getInt8PtrTy(), builder.getInt64Ty());
 
-    builder.CreateCall(Init, {NewAlloca, NewSize, OldSize}); // call the canary initialization fun with allocation pointer and size
-    Value *Ptr = builder.CreateBitCast(NewAlloca, Alloca->getType()); // convert the pointer to the original pointer
-
+    builder.CreateCall(Init, {NewAlloca, OldSize}); // call the token initialization fun with allocation pointer and size
+    Value *Ptr = builder.CreateBitCast(builder.CreateAdd(NewAlloca, builder.getInt64(sizeof(uint64_t) * 2)), Alloca->getType()); // convert the pointer to the original pointer
     std::vector<User *> Replace, Lifetimes; // Update the user info
     for (User *Usr: Alloca->users())
     {
@@ -309,7 +336,7 @@ static void replaceAlloca(Module *M, Instruction *I,
 }
 
 /*
- * Replace global variables with a canary version.
+ * Replace global variables
  */
 static void replaceGlobal(Module *M, GlobalVariable *GV,
     std::vector<Constant *> &Metadata, std::vector<GlobalVariable *> &dels)
@@ -338,37 +365,72 @@ static void replaceGlobal(Module *M, GlobalVariable *GV,
         return;
 
     const DataLayout &DL = M->getDataLayout();
-    size_t size = DL.getTypeAllocSize(Ty);                                  // acquire the size of the original data
-    size_t new_size = size + 2 * sizeof(uint64_t);
-    size_t canary_size = new_size - size;                                   // set the size of the token
+    size_t old_size = DL.getTypeAllocSize(Ty);                                  // acquire the size of the original data
+    size_t delta_size = old_size % sizeof(uint64_t) > 0 ? sizeof(uint64_t) - old_size % sizeof(uint64_t) : 0;
+    size_t underflow_token_size = sizeof(uint64_t);
+    size_t overflow_token_size = sizeof(uint64_t) + delta_size;
 
     LLVMContext &Cxt = M->getContext();
-    Type *CanaryTy = ArrayType::get(Type::getInt8Ty(Cxt), canary_size);     // create the data structure of the token
-    StructType *WrapTy = StructType::get(Cxt, {Ty, CanaryTy}, false);
+    Type *UnderflowTokenTy = ArrayType::get(Type::getInt8Ty(Cxt), underflow_token_size);
+    Type *OverflowTokenTy = ArrayType::get(Type::getInt8Ty(Cxt), overflow_token_size);
+    StructType *WrapTy = StructType::get(Cxt, {UnderflowTokenTy, Ty, OverflowTokenTy}, false);      // create the data structure of the token
 
-    Constant *WrapInit = ConstantStruct::get(WrapTy, {GV->getInitializer(),
-        Constant::getNullValue(CanaryTy)});
+    Constant *WrapInit = ConstantStruct::get(WrapTy, {Constant::getNullValue(UnderflowTokenTy),       // construct the initialization function of the new data strucutre
+        GV->getInitializer(), Constant::getNullValue(OverflowTokenTy)});
 
-    GlobalVariable *NewGV = new GlobalVariable(*M, WrapTy, GV->isConstant(),// create a data structure which wraps both origin data and the token
+    GlobalVariable *NewGV = new GlobalVariable(*M, WrapTy, GV->isConstant(),// create a global variable from the new data structure
         GV->getLinkage(), WrapInit, "", GV, GV->getThreadLocalMode());
     NewGV->copyAttributesFrom(GV);                                          // copy all previous attributes to the new one
     NewGV->setConstant(false);
-    NewGV->setSection("__canary_gbls");                                     // put all new global variables in the new section
-
+    NewGV->setSection("__prasan_gbls");                                     // put all new global variables in the new section
+    NewGV->setAlignment(Align(sizeof(uint64_t)));
     Type *Int32Ty = Type::getInt32Ty(Cxt);
-    Constant *Idxs00[2] = {ConstantInt::get(Int32Ty, 0),
-                           ConstantInt::get(Int32Ty, 0)};
-    GV->replaceAllUsesWith(
-        ConstantExpr::getGetElementPtr(WrapTy, NewGV, Idxs00, true));       // Update all pointers which use the global variable
-    NewGV->takeName(GV);
-    dels.push_back(GV);
-
     Constant *Idxs01[2] = {ConstantInt::get(Int32Ty, 0),
                            ConstantInt::get(Int32Ty, 1)};
-    Constant *CanaryPtr = ConstantExpr::getGetElementPtr(WrapTy, NewGV,
-        Idxs01, true);
-    CanaryPtr = ConstantExpr::getBitCast(CanaryPtr, Type::getInt8PtrTy(Cxt));// Get the pointer to the token
-    Metadata.push_back(CanaryPtr);
+    GV->replaceAllUsesWith(
+        ConstantExpr::getGetElementPtr(WrapTy, NewGV, Idxs01, true));       // Update all pointers which use the global variable
+
+    NewGV->setName(std::string("prasan_gv_")+GV->getName());
+    dels.push_back(GV);
+
+    Constant *Idxs00[2] = {ConstantInt::get(Int32Ty, 0),
+                           ConstantInt::get(Int32Ty, 0)};
+    Constant *UnderflowTokenPtr = ConstantExpr::getGetElementPtr(WrapTy, NewGV,
+        Idxs00, true);
+    Metadata.push_back(ConstantExpr::getBitCast(UnderflowTokenPtr, Type::getInt8PtrTy(Cxt)));  // put the pointer pointing to the underflow token to the metadata
+
+    Constant *Idxs02[2] = {ConstantInt::get(Int32Ty, 0),
+                           ConstantInt::get(Int32Ty, 2)};
+    Constant *OverflowTokenPtrWithDelta = ConstantExpr::getGetElementPtr(WrapTy, NewGV,
+        Idxs02, true);
+    Metadata.push_back(ConstantExpr::getBitCast(OverflowTokenPtrWithDelta, Type::getInt8PtrTy(Cxt)));   // put the pointer pointing to the overflow token to the metadata
+
+    switch (GV->getLinkage())
+    {
+    case llvm::GlobalValue::ExternalLinkage:
+    case llvm::GlobalValue::WeakAnyLinkage:
+    case llvm::GlobalValue::WeakODRLinkage:
+    case llvm::GlobalValue::CommonLinkage:
+    {
+        // We need to alias GV with NewGV offset by underflow token.
+        // Unfortunately LLVM can not correctly alias all GV in cross-file references,
+        // so we use inline asm instead:
+        std::string Asm(".globl ");
+        Asm += GV->getName();
+        Asm += '\n';
+        Asm += ".set ";
+        Asm += GV->getName();
+        Asm += ", ";
+        Asm += NewGV->getName();
+        Asm += '+';
+        Asm += std::to_string(underflow_token_size);
+        M->appendModuleInlineAsm(Asm);
+        break;
+    }
+    default:
+        break;
+    }
+
 }
 
 /*
@@ -411,7 +473,6 @@ static bool insertCheck(Module *M, Instruction *I)
         return false;
     if (!shouldCheck(M, Ptr))
         return false;
-
     size_t size = 0;
     Type *Ty = Ptr->getType();
     if (auto *PtrTy = dyn_cast<PointerType>(Ty))
@@ -423,7 +484,7 @@ static bool insertCheck(Module *M, Instruction *I)
 
     Ptr = builder.CreateBitCast(Ptr, builder.getInt8PtrTy()); // cast the real operating pointer address
 
-    FunctionCallee Check = M->getOrInsertFunction("__canary_check",
+    FunctionCallee Check = M->getOrInsertFunction("__prasan_check",
         builder.getVoidTy(), builder.getInt8PtrTy(),
         builder.getInt64Ty());
 
@@ -431,8 +492,44 @@ static bool insertCheck(Module *M, Instruction *I)
     return true;
 }
 
+/*
+ * Disable the loop idom optimization in LLVM.
+ */
+static void replaceMemInst(Module *M, Instruction *I,
+    std::vector<Instruction *> &dels)
+{
+    if (MemCpyInst* MemInst = dyn_cast<MemCpyInst>(I)) {
+        IRBuilder<> builder(I);
+        FunctionCallee OriginMemInst = M->getOrInsertFunction("memcpy",
+        builder.getVoidTy(), builder.getInt8PtrTy(),
+        builder.getInt8PtrTy(), builder.getInt64Ty());
+        Value* Dest = MemInst->getDest();
+	    Value* Src = MemInst->getSource();
+	    Value* Size = MemInst->getLength();
+        Dest = builder.CreateBitCast(Dest, builder.getInt8PtrTy());
+        Src = builder.CreateBitCast(Src, builder.getInt8PtrTy());
+        builder.CreateCall(OriginMemInst, {Dest, Src, Size});
+        dels.push_back(MemInst);
+    }
+}
 
-char AFLCoverage::ID = 0;
+/*
+ * Read a configuration value.
+ */
+static size_t get_config(const char *name, size_t _default)
+{
+    const char *str = getenv(name);
+    if (str == NULL)
+        return _default;
+    char *end = NULL;
+    errno = 0;
+    size_t val = (size_t)strtoull(str, &end, 0);
+    if (errno != 0)
+        errs()<<"failed to parse string \""<<str<<"\" into an integer: "<<strerror(errno);
+    else if (end == NULL || *end != '\0')
+        errs()<<"failed to parse string \""<<str<<"\" into an integer";
+    return val;
+}
 
 
 bool AFLCoverage::runOnModule(Module &M) {
@@ -464,36 +561,52 @@ bool AFLCoverage::runOnModule(Module &M) {
       FATAL("Bad value of AFL_INST_RATIO (must be between 1 and 100)");
 
   }
-    // Canary add-on
-    uint16_t alloca_num = 0;
-    uint16_t global_num = 0;
-    uint16_t heap_num = 0;
-    std::vector<Constant *> Metadata;
-    bool AFL_CHECK_CANARY = (getenv("AFL_CHECK_CANARY") != nullptr);
-    if (AFL_CHECK_CANARY) {
-      {
-        std::vector<Instruction *> dels;
-        for (auto &F : M)
-            for (auto &BB: F)
-                for (auto &I: BB)
-                    replaceAlloca(&M, &I, dels);
-        alloca_num += dels.size();
-        for (auto *I: dels)
-            I->eraseFromParent();
-      }
-      {
-        std::vector<GlobalVariable *> dels;
-        for (auto &GV: M.getGlobalList())
-            replaceGlobal(&M, &GV, Metadata, dels);
-        global_num += dels.size();
-        for (auto *V: dels)
-            V->eraseFromParent();
-      }
-        for (auto &F : M)
-            for (auto &BB: F)
-                for (auto &I: BB)
-                    heap_num += insertCheck(&M, &I) ? 1 : 0;
+
+  /* The add-on of the PrASAN instrumentation part 1 */
+  uint16_t alloca_num = 0;
+  uint16_t global_num = 0;
+  uint16_t heap_num = 0;
+  std::vector<Constant *> Metadata;
+
+  bool AFL_CHECK_PRASAN = (getenv("AFL_CHECK_PRASAN") != nullptr);
+  if (AFL_CHECK_PRASAN) {
+    nonce_size = get_config("PRASAN_NONCE_SIZE", 61);
+    {
+      std::vector<Instruction *> dels;
+      for (auto &F : M)
+        for (auto &BB: F)
+          for (auto &I: BB)
+            replaceAlloca(&M, &I, dels);
+      alloca_num += dels.size();
+      for (auto *I: dels)
+        I->eraseFromParent();
     }
+
+
+    {
+      std::vector<GlobalVariable *> dels;
+      for (auto &GV: M.getGlobalList())
+        replaceGlobal(&M, &GV, Metadata, dels);
+      global_num += dels.size();
+      for (auto *V: dels)
+        V->eraseFromParent();
+    }
+
+    for (auto &F : M)
+      for (auto &BB: F)
+        for (auto &I: BB)
+          heap_num += insertCheck(&M, &I) ? 1 : 0;
+
+    {
+      std::vector<Instruction *> dels;
+      for (auto &F : M)
+        for (auto &BB: F)
+          for (auto &I: BB)
+            replaceMemInst(&M, &I, dels);
+      for (auto *I: dels)
+        I->eraseFromParent();
+    }
+  }
 
   /* Get globals for the SHM region and the previous location. Note that
      __afl_prev_loc is thread-local. */
@@ -567,12 +680,12 @@ bool AFLCoverage::runOnModule(Module &M) {
 
   }
 
-    // Canary Add-on
-    if (AFL_CHECK_CANARY) {
-        buildCheck(&M);
-        buildInit(&M, Metadata);
-        errs() << alloca_num << " " << global_num << " " << heap_num << "\n";
-    }
+  /* The add-on of the PrASAN instrumentation part 2 */
+  if (AFL_CHECK_PRASAN) {
+    buildCheck(&M);
+    buildInit(&M, Metadata);
+    errs() <<"Size: "<< AFLCoverage::nonce_size<<" "<< alloca_num << " " << global_num << " " << heap_num << "\n";
+  }
 
   return true;
 
