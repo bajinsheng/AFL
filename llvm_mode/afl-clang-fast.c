@@ -133,6 +133,10 @@ static void edit_params(u32 argc, char** argv) {
   cc_params[cc_par_cnt++] = "-sanitizer-coverage-block-threshold=0";
 #endif
 #else
+  if (getenv("AFL_CHECK_PRASAN") != NULL) {
+    cc_params[cc_par_cnt++] = "-ldl";
+    cc_params[cc_par_cnt++] = "-lprasan";
+  }
   cc_params[cc_par_cnt++] = "-Xclang";
   cc_params[cc_par_cnt++] = "-load";
   cc_params[cc_par_cnt++] = "-Xclang";
